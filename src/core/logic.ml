@@ -1,5 +1,7 @@
-(* module Logic *)
-(* author: Costin Badescu *)
+(*
+ * module Logic
+ * author: Costin Badescu
+ *)
 
 module S = Substitution.LF
 open Printf
@@ -8,16 +10,17 @@ open Syntax.Int
 
 module Options = struct
 
-  (* Enable the logic programming engine (disabled by default). *)
+  (* Enable the logic programming engine. *)
   let enableLogic = ref true
 
-  (* Control verbosity level:
-       0 => No output.
-       1 => Query and success notification.
-       2 => + Error messages.
-       3 => + Solutions and proof terms.
-       4 => + LF signature.
-  *)
+  (*
+   * Control verbosity level:
+   *   0 => No output.
+   *   1 => Query and success notification.
+   *   2 => + Error messages.
+   *   3 => + Solutions and proof terms.
+   *   4 => + LF signature.
+   *)
   let chatter = ref 3
 
   (* Ask before giving more solutions (à la Prolog). *)
@@ -29,42 +32,44 @@ module Options = struct
 end
 
 
-(* Naming conventions:
-     g : goal
-   Goal.
-     r : res
-   Residual goal.
-     cPsi : LF.dctx
-   Universal typing context.
-     tD : typ_decl
-   LF type declaration.
-     dPool : dPool
-   Pool of dynamic assumptions.
-     cG : conjunction
-   Conjunction of goals.
-     eV : LF.dctx
-   Context with TypDecl's of existential variables belonging to a clause.
-     dCl : clause
-   Dynamic clause.
-     sCl : clause
-   Clause from LF signature.
-     cS : int
-   Constant shift for BVar indices bound to existential variables.
-     dS : int
-   Dynamic shift for indices of variables in dynamic clauses.
-     dR : int
-   Range of de Bruijn indices in the dynamic scope.
-*)
+(*
+ * Naming conventions:
+ * 
+ *   g : goal
+ * Goal.
+ *   r : res
+ * Residual goal.
+ *   cPsi : LF.dctx
+ * Universal typing context.
+ *   tD : typ_decl
+ * LF type declaration.
+ *   dPool : dPool
+ * Pool of dynamic assumptions.
+ *   cG : conjunction
+ * Conjunction of goals.
+ *   eV : LF.dctx
+ * Context with TypDecl's of existential variables belonging to a clause.
+ *   dCl : clause
+ * Dynamic clause.
+ *   sCl : clause
+ * Clause from LF signature.
+ *   cS : int
+ * Constant shift for BVar indices bound to existential variables.
+ *   dS : int
+ * Dynamic shift for indices of variables in dynamic clauses.
+ *   dR : int
+ * Range of de Bruijn indices in the dynamic scope.
+ *)
 
 
 type goal =                             (* Goals            *)
   | Atom of LF.typ                      (* g ::= A          *)
   | Impl of (res * LF.typ_decl) * goal  (*     | r => g'    *)
-  | All of LF.typ_decl * goal           (*     | ∀x:A. g'   *)
+  | All  of LF.typ_decl * goal          (*     | ∀x:A. g'   *)
 
 and res =                               (* Residual Goals   *)
-  | Head of LF.typ                      (* r ::= A          *)
-  | And of goal * res                   (*     | g ∧ r'     *)
+  | Head   of LF.typ                    (* r ::= A          *)
+  | And    of goal * res                (*     | g ∧ r'     *)
   | Exists of LF.typ_decl * res         (*     | ∃x:T. r'   *)
 
 type conjunction =                      (* Subgoals         *)
@@ -76,202 +81,273 @@ type bound = int option                 (* b ::= '*' | nat  *)
 and query = (goal * LF.sub)             (* q ::= (g, s)     *)
 
 type clause =                    (* Horn Clause ::= eV |- A :- cG   *)
-    { tHead : LF.typ             (* Head A : LF.Atom                *)
-    ; eVars : LF.dctx            (* Context eV : EV's bound in A/cG *)
+    { tHead    : LF.typ          (* Head A : LF.Atom                *)
+    ; eVars    : LF.dctx         (* Context eV : EV's bound in A/cG *)
     ; subGoals : conjunction }   (* Subgoals cG : solv. cG => A     *)
-
 
 module Shift : sig
 
-  val shiftAtom : LF.typ -> (int * int * int) -> LF.typ
+  val atom : LF.typ -> (int * int * int) -> LF.typ
 
 end = struct
 
   (* NB.
+   *
+   * Only BVar's in LF.Atom's are affected.
+   * Enclosed substitutions are not shifted.
+   * 
+   * i: De Bruijn index.
+   * k: Shifting measure.
+   * 
+   * Algorithm:
+   * 
+   * BV bound by λ remain invariant.
+   *  - i < lR |- BV(i) -> BV(i)
+   * 
+   * BV bound by a dynamic scope are shifted by dS.
+   *  - lR < i <= dR |- BV(i) -> BV(i + dS)
+   * 
+   * BV bound to EV are shifted by k.
+   *  - i > lR && i > dR |- BV(i) -> BV(i + k)
+   *
+   * 
+   * Notations:
+   * 
+   * tA : LF type
+   * tS : LF spine
+   * tN : LF normal
+   * tH : LF head
+   *)
 
-     Only BVar's in LF.Atom's are affected.
-     Enclosed substitutions are not shifted.
-
-     i: De Bruijn index.
-     k: Shifting measure.
-
-     Algorithm:
-
-     BV bound by λ remain invariant.
-      - i < lR |- BV(i) -> BV(i)
-
-     BV bound by a dynamic scope are shifted by dS.
-      - lR < i <= dR |- BV(i) -> BV(i + dS)
-
-     BV bound to EV are shifted by k.
-      - i > lR && i > dR |- BV(i) -> BV(i + k)
-  *)
-
-  let lR = ref 0               (* Range of Lambda Scope *)
+  let lR = ref 0               (* Range of Lambda Scope  *)
   let dR = ref 0               (* Range of Dynamic Scope *)
-  let dS = ref 0               (* Dynamic Shift *)
+  let dS = ref 0               (* Dynamic Shift          *)
 
-  let rec shiftTyp tM k = match tM with
-    | LF.Atom (l, c, tS) ->
-      LF.Atom (l, c, shiftSpine tS k)
-    | x -> x
+  (* val typ : LF.typ -> int -> LF.typ *)
+  let rec typ tA k  =
+    match tA with
+      | LF.Atom (l, c, tS) ->
+	LF.Atom (l, c, spine tS k)
 
-  and shiftSpine tS k = match tS with
-    | LF.App (tN, tS) ->
-      LF.App (shiftNormal tN k, shiftSpine tS k)
-    | LF.SClo (tS, s) ->
-      LF.SClo (shiftSpine tS k, s)
-    | LF.Nil -> LF.Nil
+      | x -> x
 
-  and shiftNormal tN k = match tN with
-    | LF.Lam (l, n, tN') ->
-      begin
-        ignore (incr lR) ;
-        let tM = LF.Lam (l, n, shiftNormal tN' k) in
-        ignore (decr lR) ; tM
-      end
+  (* val spine : LF.spine -> int -> spine *)
+  and spine tS k  =
+    match tS with
+      | LF.App (tN, tS) ->
+	LF.App (normal tN k, spine tS k)
+
+      | LF.SClo (tS, s) ->
+	LF.SClo (spine tS k, s)
+
+      | LF.Nil -> LF.Nil
+
+  (* val normal : LF.normal -> int -> LF.normal *)
+  and normal tN k =
+    match tN with
+      | LF.Lam (l, n, tN') ->
+	(
+          incr lR;
+          let tM = LF.Lam (l, n, normal tN' k) in
+          decr lR;
+	  tM
+	)
     | LF.Root (l, tH, tS) ->
-      LF.Root (l, shiftHead tH k, shiftSpine tS k)
+      LF.Root (l, head tH k, spine tS k)
+
     | LF.Clo (tN, s) ->
-      LF.Clo (shiftNormal tN k, s)
+      LF.Clo (normal tN k, s)
+
     | LF.Tuple (l, tP) ->
-      LF.Tuple (l, shiftTuple tP k)
+      LF.Tuple (l, tuple tP k)
 
-  and shiftHead tH k = match tH with
-    | LF.BVar (i) ->
-      if i > !lR && i > !dR then
-        LF.BVar (i + k)
-      else if i > !lR && i <= !dR then
-        LF.BVar (i + !dS)
-      else
-        LF.BVar (i)
-    | LF.AnnH (tH, tM) ->
-      LF.AnnH (shiftHead tH k, tM)
-    | LF.Proj (tH, n) ->
-      LF.Proj (shiftHead tH k, n)
-    | x -> x
+  (* val head : LF.head -> int -> LF.head *)
+  and head tH k =
+    match tH with
+      | LF.BVar (i) ->
+	if i > !lR && i > !dR then
+          LF.BVar (i + k)
+	else if i > !lR && i <= !dR then
+          LF.BVar (i + !dS)
+	else
+          LF.BVar (i)
 
-  and shiftTuple tP k = match tP with
-    | LF.Last (tN) ->
-      LF.Last (shiftNormal tN k)
-    | LF.Cons (tN, tP') ->
-      LF.Cons (shiftNormal tN k, shiftTuple tP' k)
+      | LF.AnnH (tH, tM) ->
+	LF.AnnH (head tH k, tM)
 
-  let shiftAtom tM (cS, dS', dR') =
-    ignore (dR := dR' ; dS := dS') ; shiftTyp tM cS
+      | LF.Proj (tH, n) ->
+	LF.Proj (head tH k, n)
+
+      | x -> x
+
+  (* val tuple : LF.tuple -> int -> LF.tuple *)
+  and tuple tP k =
+    match tP with
+      | LF.Last (tN) ->
+	LF.Last (normal tN k)
+
+      | LF.Cons (tN, tP') ->
+	LF.Cons (normal tN k, tuple tP' k)
+
+  (* val atom : LF.typ -> int * int * int -> LF.typ *)
+  let atom tA (cS, dS', dR') =
+    dR := dR';
+    dS := dS';
+    typ tA cS
 
 end
 
 
 module Convert = struct
 
-  (* typToClause' eV cG M (cS, dS, dR) = clause
-     Invariants:
-       If BV(i) is free in M, then BV(i) is bound in (eV |- M).
-       If M = PiTyp (x:A, No), then M ~ g.
-  *)
-  let rec typToClause' eV cG tM (cS, dS, dR) = match tM with
-    | LF.PiTyp ((tD, LF.Maybe), tM') ->
-      typToClause' (LF.DDec (eV, tD)) cG tM' (cS, dS, dR)
-    | LF.PiTyp ((LF.TypDecl(_, tA), LF.No), tB) ->
-      typToClause' eV (Conjunct (cG, typToGoal tA (cS, dS, dR)))
-        tB (cS + 1, dS, dR)
-    | LF.Atom (_) as tA ->
-      { tHead = (Shift.shiftAtom tA (-cS, -dS, dR))
-      ; eVars = eV
-      ; subGoals = cG }
+  (* val typToClause' LF.dctx -> conjunction -> LF.typ -> int * int * int -> clause
+   *
+   * typToClause' eV cG M (cS, dS, dR) = clause
+   * Invariants:
+   *   If BV(i) is free in M, then BV(i) is bound in (eV |- M).
+   *   If M = PiTyp (x:A, No), then M ~ g.
+   *)
+  let rec typToClause' eV cG tM (cS, dS, dR) =
+    match tM with
+      | LF.PiTyp ((tD, LF.Maybe), tM') ->
+	typToClause' (LF.DDec (eV, tD)) cG tM' (cS, dS, dR)
+	  
+      | LF.PiTyp ((LF.TypDecl(_, tA), LF.No), tB) ->
+	typToClause' eV (Conjunct (cG, typToGoal tA (cS, dS, dR)))
+          tB (cS + 1, dS, dR)
+	  
+      | LF.Atom (_) as tA ->
+	{ tHead    = (Shift.atom tA (-cS, -dS, dR))
+	; eVars    = eV
+	; subGoals = cG }
 
-  and typToGoal tM (cS, dS, dR) = match tM with
-    | LF.PiTyp ((tD, LF.Maybe), tM') ->
-      All (tD, typToGoal tM' (cS, dS, dR + 1))
-    | LF.PiTyp ((LF.TypDecl (x, tA) as tD, LF.No), tB) ->
-      Impl ((typToRes tA (cS, dS, dR), tD), typToGoal tB
-        (cS, dS, dR + 1))
-    | LF.Atom (_) as tA ->
-      Atom (Shift.shiftAtom tA (-cS, -dS, dR))
+  (* val typToGoal LF.typ -> int * int * int -> goal *)
+  and typToGoal tM (cS, dS, dR) =
+    match tM with
+      | LF.PiTyp ((tD, LF.Maybe), tM') ->
+	All (tD, typToGoal tM' (cS, dS, dR + 1))
 
-  and typToRes tM (cS, dS, dR) = match tM with
-    | LF.PiTyp ((tD, LF.Maybe), tM') ->
-      Exists (tD, typToRes tM' (cS, dS, dR + 1))
-    | LF.PiTyp ((LF.TypDecl (_, tA), LF.No), tB) ->
-      And (typToGoal tA (cS, dS, dR), typToRes tB
-        (cS + 1, dS + 1, dR + 1))
-    | LF.Atom (_) as tA ->
-      Head (Shift.shiftAtom tA (-cS, -dS, dR))
+      | LF.PiTyp ((LF.TypDecl (x, tA) as tD, LF.No), tB) ->
+	Impl ((typToRes tA (cS, dS, dR), tD),
+	      typToGoal tB (cS, dS, dR + 1))
 
-  let rec resToClause' eV cG (r, s) = match r with
-    | Exists (tD, r') ->
-      resToClause' (LF.DDec (eV, tD)) cG (r', S.dot1 s)
-    | And (g, r') ->
-      resToClause' eV (Conjunct (cG, g)) (r', s)
-    | Head (tA) ->
-      let (tA', _) = Whnf.whnfTyp (tA, s) in
-      { tHead = tA' ; eVars = eV ; subGoals = cG }
+      | LF.Atom (_) as tA ->
+	Atom (Shift.atom tA (-cS, -dS, dR))
+	  
+  (* val typToRes LF.typ -> int * int * int -> res *)
+  and typToRes tM (cS, dS, dR) =
+    match tM with
+      | LF.PiTyp ((tD, LF.Maybe), tM') ->
+	Exists (tD, typToRes tM' (cS, dS, dR + 1))
 
+      | LF.PiTyp ((LF.TypDecl (_, tA), LF.No), tB) ->
+	And (typToGoal tA (cS, dS, dR), typToRes tB
+          (cS + 1, dS + 1, dR + 1))
+
+      | LF.Atom (_) as tA ->
+	Head (Shift.atom tA (-cS, -dS, dR))
+
+  (* val resToClause' : LF.dctx -> LF.conjunction -> res * LF.sub -> clause *)
+  let rec resToClause' eV cG (r, s) =
+    match r with
+      | Exists (tD, r') ->
+	resToClause' (LF.DDec (eV, tD)) cG (r', S.dot1 s)
+
+      | And (g, r') ->
+	resToClause' eV (Conjunct (cG, g)) (r', s)
+
+      | Head (tA) ->
+	let (tA', _) = Whnf.whnfTyp (tA, s) in
+	{ tHead    = tA'
+	; eVars    = eV
+	; subGoals = cG }
+
+  (* val resToClause : res * LF.sub -> clause *)
   let resToClause (r, s) =
     resToClause' LF.Null True (r, s)
 
+  (* val typToClause : LF.typ -> clause *)
   let typToClause tM =
     typToClause' LF.Null True tM (0, 0, 0)
-
-  (* etaExpand Psi (A, s) = normal
-     Invariants:
-       Psi |- s : Phi
-       Phi |- A : LF.typ
-
-     Effects:
-       None.
-  *)
+      
+  (* val etaExpand : LF.dctx -> LF.tclo -> LF.normal
+   *  LF.tclo = LF.typ * LF.sub
+   *
+   * etaExpand Psi (A, s) = normal
+   * Invariants:
+   *   Psi |- s : Phi
+   *   Phi |- A : LF.typ
+   * 
+   * Effects:
+   *   None.
+   *)
   let rec etaExpand cPsi sA =
-    let (tA, s) = Whnf.whnfTyp sA
-    in match tA with
+    let (tA, s) = Whnf.whnfTyp sA in
+    match tA with
       | LF.Atom (_) as tA ->
         let u = Whnf.newMVar None (cPsi, LF.TClo (tA, s)) LF.Maybe in
         LF.Root (Syntax.Loc.ghost, LF.MVar (u, S.id), LF.Nil)
+	  
       | LF.PiTyp ((LF.TypDecl (x, tA) as tD, _), tB) ->
         LF.Lam (Syntax.Loc.ghost, x, etaExpand
           (LF.DDec (cPsi, S.decSub tD s)) (tB, S.dot1 s))
 
-  (* dctxToSub Psi (eV, s) fS = sub * (spine -> spine)
-     Invariants:
-       eV = Null | ((Null, Dec (x, M)), ...)
-       Psi |- s : Phi
-       Phi |- M
-       fS : spine -> spine
-
-     Effects:
-       None.
-
-     Create MVars for all the TypDecl's in eV. Accumulate them
-     in a substitution, performing eta-expansion if necessary,
-     and add them to the spine of a proof-term through fS.
-  *)
-  let rec dctxToSub cPsi (eV, s) fS = match eV with
-    | LF.DDec (eV', LF.TypDecl (_, tM)) ->
-      let (s', fS') = dctxToSub cPsi (eV', s) fS in
-      let tM' = etaExpand cPsi (tM, s') in
-      (LF.Dot (LF.Obj tM', s'), (fun tS -> fS' (LF.App (tM', tS))))
-    | LF.Null -> (s, fS)
-    | LF.CtxVar (_) -> invalid_arg
-        "Logic.Convert.dctxToSub: Match conflict with LF.CtxVar (_)."
-
-  (* typToQuery (M, i)  = ((g, s), xs)
-     Transform a reconstructed LF.typ into a query, accumulating all
-     the abstracted existential variables into a substitution while
-     storing the MVars into a list `xs' for immediate access.
-  *)
+  (* val dctxToSub : LF.dctx -> LF.dctx * LF.sub -> (LF.spine -> LF.spine)
+   *                 -> (LF.sub * (LF.spine -> LF.spine))
+   *
+   * dctxToSub Psi (eV, s) fS = sub * (spine -> spine)
+   * Invariants:
+   *   eV = Null | ((Null, Dec (x, M)), ...)
+   *   Psi |- s : Phi
+   *   Phi |- M
+   *   fS : spine -> spine
+   * 
+   * Effects:
+   *   None.
+   * 
+   * Create MVars for all the TypDecl's in eV. Accumulate them
+   * in a substitution, performing eta-expansion if necessary,
+   * and add them to the spine of a proof-term through fS.
+   *)
+  let rec dctxToSub cPsi (eV, s) fS =
+    match eV with
+      | LF.DDec (eV', LF.TypDecl (_, tM)) ->
+	let (s', fS') = dctxToSub cPsi (eV', s) fS in
+	let tM' = etaExpand cPsi (tM, s') in
+	(LF.Dot (LF.Obj tM', s'), (fun tS -> fS' (LF.App (tM', tS))))
+	  
+      | LF.Null -> (s, fS)
+	
+      | LF.CtxVar (_) ->
+	invalid_arg "Logic.Convert.dctxToSub: Match conflict with LF.CtxVar (_)."
+	  
+  (* val typToQuery : LF.typ * int -> (query * LF.typ * LF.sub * Index.inst list)
+   *  Index.inst = Id.name * LF.normal
+   * 
+   * typToQuery (M, i)  = ((g, s), xs)
+   * Transform a reconstructed LF.typ into a query, accumulating all
+   * the abstracted existential variables into a substitution while
+   * storing the MVars into a list `xs' for immediate access.
+   *)
   let typToQuery (tA, i) =
-    let rec typToQuery' (tA, i) s xs = match tA with
-      | LF.PiTyp ((LF.TypDecl (x, tA), LF.Maybe), tB) when i > 0 ->
-        let tN' = etaExpand LF.Null (tA, s) in
-        typToQuery' (tB, i - 1) (LF.Dot (LF.Obj tN', s))
-          ((x, tN') :: xs)
-      | _ -> ((typToGoal tA (0, 0, 0), s), tA, s, xs)
-    in typToQuery' (tA, i) S.id []
+    let rec typToQuery' (tA, i) s xs =
+      match tA with
+	| LF.PiTyp ((LF.TypDecl (x, tA), LF.Maybe), tB) when i > 0 ->
+          let tN' = etaExpand LF.Null (tA, s) in
+          typToQuery' (tB, i - 1) (LF.Dot (LF.Obj tN', s))
+            ((x, tN') :: xs)
+	
+	| _ -> ((typToGoal tA (0, 0, 0), s), tA, s, xs)
+    in
+    typToQuery' (tA, i) S.id []
 
-  let rec solToSub xs = match xs with
-    | [] -> S.id
-    | (x, tN) :: xs -> LF.Dot (LF.Obj tN, solToSub xs)
+  (* val solToSub : Index.inst list -> LF.sub
+   *  Index.inst = Id.name * LF.normal
+   *)
+  let rec solToSub xs =
+    match xs with
+      | [] -> S.id
+      | (x, tN) :: xs -> LF.Dot (LF.Obj tN, solToSub xs)
 
 end
 
@@ -285,67 +361,83 @@ module Index = struct
   type inst = (Id.name * LF.normal)     (* I ::= (x, MVar)             *)
 
   and sgnQuery =
-      { query : query                   (* Query ::= (g, s)            *)
-      ; typ : LF.typ                    (* Query as LF.typ.            *)
+      { query     : query               (* Query ::= (g, s)            *)
+      ; typ       : LF.typ              (* Query as LF.typ.            *)
       ; skinnyTyp : LF.typ              (* Query stripped of E-vars.   *)
-      ; optName : Id.name option        (* Opt. name of proof term.    *)
-      ; expected : bound                (* Expected no. of solutions.  *)
-      ; tries : bound                   (* No. of tries to find soln.  *)
+      ; optName   : Id.name option      (* Opt. name of proof term.    *)
+      ; expected  : bound               (* Expected no. of solutions.  *)
+      ; tries     : bound               (* No. of tries to find soln.  *)
       ; instMVars : inst list }         (* MVar instantiations.        *)
+	
+  (*type sgnClause = Id.cid_term * clause*)
 
   let queries = DynArray.create ()      (* sgnQuery DynArray.t         *)
 
   let querySub = ref S.id
 
-  (* addTyp c = sgnClause DynArray.t
-     Create a new entry for a type constant, c, in the `types' table and
-     return it's mapping, i.e. an empty DynArray.
-  *)
+  (* val addTyp : Id.cid_typ -> sgnClause DynArray.t
+   *  sgnClause = Id.cid_term * clause
+   * 
+   * addTyp c = sgnClause DynArray.t
+   * Create a new entry for a type constant, c, in the `types' table and
+   * return it's mapping, i.e. an empty DynArray.
+   *)
   let addTyp cidTyp =
-    Hashtbl.add types cidTyp (DynArray.create ()) ;
-    Hashtbl.find types cidTyp
+    let sgnClauseArray = DynArray.create () in
+    Hashtbl.add types cidTyp sgnClauseArray;
+    sgnClauseArray
 
-  (* addSgnClause tC, sCl = ()
-     Add a new sgnClause, sCl, to the DynArray tC.
-  *)
+  (* val addSgnClause : sgnClause DynArray.t -> sgnClause -> unit
+   *
+   * addSgnClause tC, sCl = ()
+   * Add a new sgnClause, sCl, to the DynArray tC.
+   *)
   let addSgnClause typConst sgnClause =
     DynArray.add typConst sgnClause
 
-  (* addSgnQuery (p, (g, s), xs, e, t)  = ()
-     Add a new sgnQuery to the `queries' DynArray.
-  *)
+  (* val addSgnQuery : Id.name option * LF.typ * LF.typ * query * inst list * bound * bound -> unit
+   *
+   * addSgnQuery (p, (g, s), xs, e, t)  = ()
+   * Add a new sgnQuery to the `queries' DynArray.
+   *)
   let addSgnQuery (p, a, a', q, xs, e, t) =
     DynArray.add queries
-      { query = q ;
-        typ = a ;
-        skinnyTyp = a' ;
-        optName = p ;
-        expected = e ;
-        tries = t ;
-        instMVars = xs }
+      { query     = q
+      ; typ       = a
+      ; skinnyTyp = a'
+      ; optName   = p
+      ; expected  = e
+      ; tries     = t
+      ; instMVars = xs }
 
-  (* compileSgnClause c = (c, sCl)
-     Retrieve LF.typ for term constant c, clausify it into sCl and
-     return an sgnClause (c, sCl).
-  *)
+  (* val compileSgnClause : Id.cid_term -> Id.cid_term
+   *
+   * compileSgnClause c = (c, sCl)
+   * Retrieve LF.typ for term constant c, clausify it into sCl and
+   * return an sgnClause (c, sCl).
+   *)
   let compileSgnClause cidTerm =
     let termEntry = Cid.Term.get cidTerm in
     let tM = termEntry.Cid.Term.typ in
     (cidTerm, Convert.typToClause tM)
 
-  (* termName c = Id.name
-     Get the string representation of term constant c.
-  *)
+  (* val termName : Id.cid_term -> Id.name
+   * 
+   * termName c = Id.name
+   * Get the string representation of term constant c.
+   *)
   let termName cidTerm =
     (Cid.Term.get cidTerm).Cid.Term.name
 
-  (* storeTypConst c = ()
-     Add a new entry in `types' for type constant c and fill the DynArray
-     with the clauses corresponding to the term constants associated with c.
-     The revIter function serves to preserve the order of term constants
-     intrinsic to the Beluga source file, since the constructors for c are
-     listed in reverse order.
-  *)
+  (* val storeTypeConst : Id.cid_typ -> unit
+   *
+   * storeTypConst c = ()
+   * Add a new entry in `types' for type constant c and fill the DynArray
+   * with the clauses corresponding to the term constants associated with c.
+   * The revIter function serves to preserve the order of term constants
+   * intrinsic to the Beluga source file, since the constructors for c are
+   * listed in reverse order.
+   *)
   let storeTypConst cidTyp =
     let typEntry = Cid.Typ.get cidTyp in
     let typConstr = !(typEntry.Cid.Typ.constructors) in
@@ -357,25 +449,32 @@ module Index = struct
       | h :: l' -> revIter f l' ; f h
     in revIter regSgnClause typConstr
 
-  (* storeQuery (p, (M, i), e, t) = ()
-     Invariants:
-       i = count of abstracted EVars in M
-  *)
+  (* val Id.name option * (LF.typ * int) * bound * bound -> unit
+   * 
+   * storeQuery (p, (M, i), e, t) = ()
+   * Invariants:
+   *   i = count of abstracted EVars in M
+   *)
   let storeQuery (p, (tM, i), e, t) =
-    let (q, tM', s, xs) = (Convert.typToQuery (tM, i)) in
-    ignore (querySub := s) ; addSgnQuery (p, tM, tM', q, xs, e, t)
+    let (q, tM', s, xs) = Convert.typToQuery (tM, i) in
+    querySub := s;
+    addSgnQuery (p, tM, tM', q, xs, e, t)
 
-  (* robStore () = ()
-     Store all type constants in the `types' table.
-  *)
+  (* val robStore : unit -> unit
+   *
+   * robStore () = ()
+   * Store all type constants in the `types' table.
+   *)
   let robStore () =
     try
       List.iter storeTypConst !(DynArray.get Cid.Typ.entry_list !(Modules.current))
     with _ -> ()
 
-  (* iterSClauses f c = ()
-     Iterate over all signature clauses associated with c.
-  *)
+  (* val iterSClauses : (Id.cid_term * clause -> unit) -> Id.cid_typ -> unit
+   *
+   * iterSClauses f c = ()
+   * Iterate over all signature clauses associated with c.
+   *)
   let iterSClauses f cidTyp =
     DynArray.iter f (Hashtbl.find types cidTyp)
 
@@ -702,72 +801,88 @@ module Frontend = struct
   exception Done                        (* Solved query successfully. *)
   exception AbortQuery of string        (* Abort solving the query.   *)
 
-  (* exceeds B1 B2 = b
-     True if B1 = * or B1 >= B2.
-  *)
-  let exceeds x y = match (x, y) with
-    | (Some i, Some j) -> i >= j
-    | (Some i, None) -> false
-    | (None, _) -> true
+  (* 
+   * exceeds B1 B2 = b
+   * True if B1 = * or B1 >= B2.
+   *)
+  let exceeds (x:bound) (y:bound) : bool =
+    match x, y with
+      | Some i, Some j -> i >= j
+      | Some i,   None -> false
+      |   None,      _ -> true
 
-  (* boundEq B1 B2 = b
-     Equality function for bounds.
-  *)
-  let boundEq x y = match (x, y) with
-    | (Some i, Some j) -> i = j
-    | (None, None) -> true
-    | (_, _) -> false
+  (* 
+   * boundEq B1 B2 = b
+   * Equality function for bounds.
+   *)
+  let boundEq (x:bound) (y:bound) : bool =
+    match x, y with
+      | Some i, Some j -> i = j
+      |   None,   None -> true
+      |      _,      _ -> false
 
-  (* lowerBound B1 B2 = min (B1, B2) *)
-  let lowerBound x y = match (x, y) with
-    | (Some i, Some j) -> Some (min i j)
-    | (x, None) -> x
-    | (None, y) -> y
+  (*
+   * lowerBound B1 B2 = min (B1, B2)
+   *)
+  let lowerBound (x:bound) (y:bound) : bound =
+    match (x, y) with
+      | Some i, Some j -> Some (min i j)
+      |      x,   None -> x
+      |   None,      y -> y
 
-  (* Abort query. *)
-  let abort s = raise (AbortQuery s)
+  (*
+   * Abort query.
+   *)
+  let abort str = raise (AbortQuery str)
 
-  (* checkSolutions e t s = () *)
-  let checkSolutions e t s = match (e, t) with
-    | (None, None) -> ()
-    | _ ->
-      if not (boundEq (lowerBound e t) (Some s)) then
-        abort ("Query error: Wrong number of solutions -- "
-               ^ "expected " ^ (P.boundToString e) ^ " in "
-               ^ (P.boundToString t) ^ " tries, but found "
-               ^ (string_of_int s))
-      else ()
+  (*
+   * checkSolutions e t s = ()
+   *)
+  let checkSolutions (expected:bound) (tries:bound) (solutions:int) =
+    let lb = lowerBound expected tries in
+    if lb <> None && not (boundEq lb (Some solutions)) then
+      abort ("Query error: Wrong number of solutions -- "
+	     ^ "expected " ^ (P.boundToString expected) ^ " in "
+	     ^ (P.boundToString tries) ^ " tries, but found "
+	     ^ (string_of_int solutions))
 
-  (* moreSolutions () = () *)
-  let moreSolutions () =
-    printf "More? " ; match (read_line ()) with
+  (*
+   * Asks the user if he wants more solutions or not.
+   *)
+  let moreSolutions () : bool =
+    printf "More? (y/N/q) ";
+    match (read_line ()) with
       | "y" | "Y" | ";" -> true
-      | "q" | "Q" -> abort "Query error -- explicit quit."
-      | _ -> false
+      | "q" | "Q"       -> abort "Query error -- explicit quit."
+      | _               -> false
 
-  (* solve q = () *)
-  let solve sgnQuery =
+  (*
+   * solve q = ()
+   *)
+  let solve (sgnQuery : Index.sgnQuery) =
 
-    (* Keep track of no. of solutions found. *)
+    (* Keep track of the number of solutions found. *)
     let solutions = ref 0 in
 
     (* Type checking function. *)
-    let check cPsi tM s = Check.LF.check LF.Empty
-      cPsi (tM, S.id) (sgnQuery.skinnyTyp, s) in
+    let check (cPsi:LF.dctx) (tM:LF.normal) (s:LF.sub) =
+	Check.LF.check LF.Empty cPsi (tM, S.id) (sgnQuery.skinnyTyp, s)
+    in
 
-
-    (* Initial success continuation. *)
-    let scInit (cPsi, tM) =
-      ignore (incr solutions) ;
-
+    (*
+     * Initial success continuation.
+     * cf article for design description.
+     *)
+    let scInit ((cPsi:LF.dctx), (tM:LF.normal)) = (*TODO: curryfy this*)
+      incr solutions;
+      
       (* Rebuild the substitution and type check the proof term. *)
       if !Options.checkProofs then
-        check cPsi tM (Convert.solToSub sgnQuery.instMVars) (* !querySub *)
-      else () ;
+        check cPsi tM (Convert.solToSub sgnQuery.instMVars); (* !querySub *)
 
       (* Print MVar instantiations. *)
       if !Options.chatter >= 3 then
-        begin
+        (
           printf "---------- Solution %d ----------\n[%s]\n%s\n"
             !solutions (P.dctxToString cPsi)
             (P.instToString sgnQuery.instMVars) ;
@@ -777,24 +892,26 @@ module Frontend = struct
               printf "%s\n" (P.instToString [(n, tM)])
             | None -> ()) ;
           printf "\n"
-        end
-      else () ;
+	);
+
       (* Interactive. *)
       if !Options.askSolution then
-        if moreSolutions () then () else raise Done
-      else () ;
+        if not (moreSolutions ()) then
+	  raise Done;
+
       (* Stop when no. of solutions exceeds tries. *)
       if exceeds (Some !solutions) sgnQuery.tries then
-        raise Done
-      else () in
+        raise Done;
+    in
+    (* End of scInit definition*)
 
     if not (boundEq sgnQuery.tries (Some 0)) then
-      begin
+      (
         if !Options.chatter >= 1 then
-          P.printQuery sgnQuery
-        else () ;
-        try
+          P.printQuery sgnQuery;
 
+        try
+	  
           Solver.solve sgnQuery.query scInit ;
           (* Check solution bounds. *)
           checkSolutions sgnQuery.expected sgnQuery.tries !solutions
@@ -802,41 +919,44 @@ module Frontend = struct
           | Done -> printf "Done.\n"
           | AbortQuery (s) -> printf "%s\n" s
           | _ -> ()
-      end
+      )
 
     else if !Options.chatter >= 2 then
       printf "Skipping query -- bound for tries = 0.\n"
 
-    else ()
-
 end
 
 
-(* Interface *)
 
-let storeQuery p (tM, i) e t =
-  Index.storeQuery (p, (tM, i), e, t)
+(* val storeQuery : Id.name option -> LF.typ * int -> bound -> bound -> unit
+ *
+ * Stores the query for a future runLogic run.
+ *)
+let storeQuery p (tA, i) expected tries =
+  Index.storeQuery (p, (tA, i), expected, tries)
 
-(* runLogic () = ()
-   If !enabledLogic, run the logic programming engine. Otherwise
-   do nothing, i.e. return unit.
-*)
+
+(*
+ * If !enabledLogic, run the logic programming engine. Otherwise do nothing.
+ *)
 let runLogic () =
   if !Options.enableLogic then
-    begin
+    (
       (* Transform LF signature into clauses. *)
       Index.robStore () ;
+      
       (* Optional: Print signature clauses. *)
       if !Options.chatter >= 4 then
-        Printer.printSignature ()
-      else () ;
+        Printer.printSignature ();
+
       (* Solve! *)
       Index.iterQueries Frontend.solve ;
+
       (* Clear the local storage.  *)
       Index.clearIndex ()
-    end
-  else () (* NOP *)
+    )
 
 
-let runLogicOn n (tA,i) e t  =
-  Index.singleQuery (n,(tA,i),e,t) Frontend.solve
+(* val runLogicOn : Id.name option -> LF.typ * int -> bound -> bound -> unit *)
+let runLogicOn p (tA, i) expected tries  =
+  Index.singleQuery (p, (tA, i), expected, tries) Frontend.solve
